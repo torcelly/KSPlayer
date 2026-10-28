@@ -39,6 +39,8 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
     weak var delegate: CodecCapacityDelegate?
     let mediaType: AVFoundation.AVMediaType
     let outputRenderQueue: CircularBuffer<Frame>
+    /// When set, decoded frames go here instead of `outputRenderQueue` (audio look-ahead).
+    var frameHandler: ((Frame) -> Void)?
     var isLoopModel = false
     var frameCount: Int { outputRenderQueue.count }
     var frameMaxCount: Int {
@@ -152,8 +154,12 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
                     }
                 }
                 if let frame = frame as? Frame {
-                    self.outputRenderQueue.push(frame)
-                    self.outputRenderQueue.fps = packet.assetTrack.nominalFrameRate
+                    if let frameHandler = self.frameHandler {
+                        frameHandler(frame)
+                    } else {
+                        self.outputRenderQueue.push(frame)
+                        self.outputRenderQueue.fps = packet.assetTrack.nominalFrameRate
+                    }
                 }
             } catch {
                 KSLog("Decoder did Failed : \(error)")
@@ -167,7 +173,7 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
                 }
             }
         }
-        if options.decodeAudioTime == 0, mediaType == .audio {
+        if options.decodeAudioTime == 0, mediaType == .audio, frameHandler == nil {
             options.decodeAudioTime = CACurrentMediaTime()
         }
         if options.decodeVideoTime == 0, mediaType == .video {

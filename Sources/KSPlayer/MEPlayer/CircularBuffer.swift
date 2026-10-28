@@ -135,6 +135,21 @@ public class CircularBuffer<Item: ObjectQueueItem> {
         return result
     }
 
+    /// The queued items, oldest first, without removing them.
+    public func snapshot() -> [Item] {
+        condition.lock()
+        defer { condition.unlock() }
+        var result = [Item]()
+        var i = headIndex
+        while i < tailIndex {
+            if let item = _buffer[Int(i & mask)] {
+                result.append(item)
+            }
+            i += 1
+        }
+        return result
+    }
+
     public func flush() {
         condition.lock()
         defer { condition.unlock() }

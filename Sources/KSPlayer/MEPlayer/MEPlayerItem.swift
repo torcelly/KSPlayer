@@ -35,6 +35,9 @@ public final class MEPlayerItem: Sendable {
     private var videoAudioTracks = [CapacityProtocol]()
     private var videoTrack: SyncPlayerItemTrack<VideoVTBFrame>?
     private var audioTrack: SyncPlayerItemTrack<AudioFrame>?
+    /// Second decoder of the audio packets, ahead of playback (`AudioLookaheadRecognize`).
+    private var audioLookahead: AsyncPlayerItemTrack<AudioFrame>?
+    private weak var lookaheadRecognizer: (any AudioLookaheadRecognize)?
     private(set) var assetTracks = [FFmpegAssetTrack]()
     private var videoAdaptation: VideoAdaptationState?
     private var videoDisplayCount = UInt8(0)
@@ -326,6 +329,7 @@ extension MEPlayerItem {
     }
 
     private func createCodec(formatCtx: UnsafeMutablePointer<AVFormatContext>) {
+        stopLookahead()
         allPlayerItemTracks.removeAll()
         assetTracks.removeAll()
         videoAdaptation = nil
@@ -502,6 +506,7 @@ extension MEPlayerItem {
                 }
                 isSeek = true
                 allPlayerItemTracks.forEach { $0.seek(time: seekToTime) }
+                seekLookahead(time: seekToTime)
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     self.seekingCompletionHandler?(result >= 0)
@@ -560,6 +565,8 @@ extension MEPlayerItem {
                     if options.readAudioTime == 0 {
                         options.readAudioTime = CACurrentMediaTime()
                     }
+                    // Before `audioTrack`: a new look-ahead starts with a copy of its queue.
+                    lookahead(packet: packet)
                     audioTrack?.putPacket(packet: packet)
                 } else {
                     first.subtitle?.putPacket(packet: packet)
@@ -572,6 +579,7 @@ extension MEPlayerItem {
                     _ = av_seek_frame(formatCtx, -1, startTime.value, AVSEEK_FLAG_BACKWARD)
                 } else {
                     allPlayerItemTracks.forEach { $0.isEndOfFile = true }
+                    audioLookahead?.isEndOfFile = true
                     state = .finished
                 }
             } else {
@@ -580,6 +588,45 @@ extension MEPlayerItem {
             }
         }
         return readResult
+    }
+
+    /// Feeds the audio look-ahead, starting or stopping it with the recognizer that wants it.
+    /// Read thread only.
+    private func lookahead(packet: Packet) {
+        let recognizer = SubtitleModel.audioRecognizes.first { $0.isEnabled } as? any AudioLookaheadRecognize
+        if recognizer !== lookaheadRecognizer {
+            stopLookahead()
+            if let recognizer, audioTrack?.isLoopModel != true {
+                // What is already read would never reach it otherwise: up to
+                // `maxBufferDuration` of audio without subtitles.
+                let queued = (audioTrack as? AsyncPlayerItemTrack<AudioFrame>)?.packetQueue.snapshot() ?? []
+                startLookahead(for: recognizer, primedWith: queued)
+            }
+        }
+        audioLookahead?.putPacket(packet: packet)
+    }
+
+    private func startLookahead(for recognizer: any AudioLookaheadRecognize, primedWith packets: [Packet]) {
+        let track = AsyncPlayerItemTrack<AudioFrame>(mediaType: .audio, frameCapacity: 1, options: options)
+        track.frameHandler = { [weak recognizer] frame in
+            recognizer?.appendLookahead(frame: frame)
+        }
+        track.decode()
+        packets.forEach { track.putPacket(packet: $0) }
+        audioLookahead = track
+        lookaheadRecognizer = recognizer
+    }
+
+    private func stopLookahead() {
+        audioLookahead?.shutdown()
+        audioLookahead = nil
+        lookaheadRecognizer = nil
+    }
+
+    private func seekLookahead(time: TimeInterval) {
+        guard let audioLookahead else { return }
+        audioLookahead.seek(time: time)
+        lookaheadRecognizer?.lookaheadDidFlush()
     }
 
     private func pause() {
@@ -634,6 +681,7 @@ extension MEPlayerItem: MediaPlayback {
         let closeOperation = BlockOperation {
             Thread.current.name = (self.operationQueue.name ?? "") + "_close"
             self.allPlayerItemTracks.forEach { $0.shutdown() }
+            self.stopLookahead()
             KSLog("清空formatCtx")
             // 自定义的协议才会av_class为空
             if let formatCtx = self.formatCtx, (formatCtx.pointee.flags & AVFMT_FLAG_CUSTOM_IO) != 0, let opaque = formatCtx.pointee.pb.pointee.opaque {
@@ -682,6 +730,7 @@ extension MEPlayerItem: MediaPlayback {
             seekingCompletionHandler = completion
             condition.broadcast()
             allPlayerItemTracks.forEach { $0.seek(time: time) }
+            seekLookahead(time: time)
         } else if state == .finished {
             seekTime = time
             state = .seeking
